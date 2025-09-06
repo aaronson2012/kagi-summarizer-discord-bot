@@ -1,15 +1,15 @@
 """
-This is all of the code for a discord bot that will summarize the given url
-content
+Discord bot that summarizes the content at a given URL using Kagi.
 
-invoke with `/summarize`
+Invoke with `/summarize`.
 """
 
 import os
+import sys
+import io
 
 import discord
-
-import requests
+import aiohttp
 
 from dotenv import load_dotenv
 
@@ -18,26 +18,38 @@ load_dotenv()
 KAGI_TOKEN = os.environ.get("KAGI_TOKEN")
 
 intents = discord.Intents.default()
-bot = discord.Client(intents=intents)
-tree = discord.app_commands.CommandTree(bot)
+intents.guilds = True  # slash commands live in guilds; no message content needed
+bot = discord.Bot(intents=intents)
 
 
-@tree.command(name="summarize", description="Summarizes the given url content")
-@discord.app_commands.describe(url="The url to summarize")
-async def summarize(ctx, url: str):
+@bot.slash_command(name="summarize", description="Summarizes the given URL's content")
+async def summarize(
+    ctx: discord.ApplicationContext,
+    url: discord.Option(str, "The URL to summarize (http/https)"),
+):
     """
     The main bot entrypoint
     """
+    # Basic validation to avoid obvious errors
+    if not url or not (url.startswith("http://") or url.startswith("https://")):
+        await ctx.respond("Please provide a valid http(s) URL.", ephemeral=True)
+        return
 
-    channel = ctx.channel
+    await ctx.defer()
 
-    if url is None:
-        await channel.send("Please provide a url to summarize")
+    try:
+        summary = await get_summary(url)
+    except Exception as e:
+        await ctx.send_followup(f"Failed to summarize: {e}")
+        return
 
-    await ctx.response.defer()
-    summary = await get_summary(url)
-
-    await ctx.followup.send(summary)
+    # Respect Discord 2000 character limit; send as file if too long
+    if len(summary) > 1900:
+        data = io.BytesIO(summary.encode("utf-8"))
+        file = discord.File(data, filename="summary.txt")
+        await ctx.send_followup(content="Summary was long; attached as file.", file=file)
+    else:
+        await ctx.send_followup(summary)
 
 
 async def get_summary(url):
@@ -45,23 +57,54 @@ async def get_summary(url):
     Get the summary from Kagi
     """
 
+    if not KAGI_TOKEN:
+        raise RuntimeError("KAGI_TOKEN is not set in environment.")
+
     base_url = "https://kagi.com/api/v0/summarize"
     params = {"url": url, "summary_type": "summary", "engine": "agnes"}
     headers = {"Authorization": f"Bot {KAGI_TOKEN}"}
 
-    try:
-        json_response = requests.get(
-            base_url, headers=headers, params=params, timeout=60
-        ).json()
-    
-        formatted_response = f"""
-[Click here for full article]({url})
-{json_response.get('data', {}).get('output') or json_response.get('error', [{}])[0].get('msg')}
-        """
-    
-        return formatted_response
-    except requests.exceptions.Timeout:
-        return "Kagi response took too long..."
+    timeout = aiohttp.ClientTimeout(total=60)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        try:
+            async with session.get(base_url, headers=headers, params=params) as resp:
+                status = resp.status
+                # Try to parse JSON safely; fall back to text
+                try:
+                    payload = await resp.json(content_type=None)
+                except aiohttp.ContentTypeError:
+                    text = await resp.text()
+                    raise RuntimeError(
+                        f"Unexpected response (status {status}): {text[:200]}"
+                    )
+
+                if status != 200:
+                    # Extract error message if present
+                    err = (
+                        payload.get("error", [{}])[0].get("msg")
+                        if isinstance(payload.get("error"), list)
+                        else payload.get("error")
+                    ) or "Unknown error"
+                    raise RuntimeError(f"Kagi error {status}: {err}")
+
+                output = (
+                    (payload.get("data") or {}).get("output")
+                    or (
+                        payload.get("error", [{}])[0].get("msg")
+                        if isinstance(payload.get("error"), list)
+                        else payload.get("error")
+                    )
+                )
+
+                if not output:
+                    raise RuntimeError("Kagi returned an empty response.")
+
+                formatted_response = (
+                    f"[Click here for full article]({url})\n{output}"
+                )
+                return formatted_response
+        except aiohttp.ServerTimeoutError:
+            return "Kagi response took too long..."
 
 
 # Sync slash command to Discord.
@@ -70,7 +113,16 @@ async def on_ready():
     """
     on_ready() syncs and updates the slash commands on the Discord server.
     """
-    await tree.sync()
+    try:
+        await bot.sync_commands()
+        print("Slash commands synced.")
+    except Exception as e:
+        print(f"Failed to sync slash commands: {e}")
 
 
-bot.run(os.environ.get("DISCORD_TOKEN"))
+token = os.environ.get("DISCORD_TOKEN")
+if not token:
+    print("DISCORD_TOKEN is not set in environment.")
+    sys.exit(1)
+
+bot.run(token)
